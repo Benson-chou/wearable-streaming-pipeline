@@ -1,0 +1,18 @@
+# Generated pipeline output
+lakehouse/
+dashboard_snapshot.html
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Logs / scratch
+*.log
+demo_*.log
+scratch_*.log
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
