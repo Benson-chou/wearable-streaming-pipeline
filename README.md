@@ -23,6 +23,7 @@ simulator.py ──JSON──▶ Kafka topic `wearables.raw` ──▶ spark_pro
 | `simulator.py` | Produces raw device JSON to Kafka — 2 users × 2 devices, 4 threads. Apple Watch sends HR every 10s in `workout` / every 5min in `rest`; Oura sends 5-min aggregates (`avg_hr`, `sleep_score`, …). |
 | `spark_processor.py` | Reads the topic, normalizes both device shapes into `(event_time, user_id, hr, activity)`, applies 15-min tumbling windows per user, writes finalized windows to Delta (partitioned by user), and POSTs anomalies. |
 | `dashboard.py` | Live Flask dashboard at `:8000` — per-user HR chart, anomaly feed, and the rolling-window table (read back from Delta). Superset of `agent_stub.py`. |
+| `agent_server.py` | Clinical-triage **AI agent** (FastAPI, `:8000`). Runs a Claude tool-use loop over `fetch_historical_trends` (7-day Delta baseline) and `convert_to_fhir` (FHIR R4 Observation), then emits a Clinician Action Report with a risk level. Needs an Anthropic API key. |
 | `agent_stub.py` | Minimal stand-in "AI agent" that logs the anomaly POSTs. |
 | `demo.sh` | One-command demo: starts everything, injects an anomaly, opens the dashboard, tears down on Ctrl-C. |
 | `docker-compose.yml` | Intended containerized infra (Kafka + Spark cluster) — see the caveat below. |
@@ -45,6 +46,8 @@ Spark 3.5 rejects Java 16+), and Python deps:
 ```bash
 brew install kafka
 pip install pyspark==3.5.1 delta-spark==3.2.0 requests kafka-python numpy pandas flask deltalake
+# for the AI triage agent (agent_server.py):
+pip install fastapi "uvicorn[standard]" anthropic        # plus: export ANTHROPIC_API_KEY=...
 ```
 
 **One-command demo:**
@@ -83,4 +86,10 @@ spark.read.format("delta").load("./lakehouse/wearable_windows").orderBy("window_
   the watermark can stall; `demo.sh` runs a pacer to keep it advancing. Size the
   watermark/window to your slowest expected source cadence in production.
 
-See [`CLAUDE.md`](./CLAUDE.md) for deeper architecture notes and gotchas.
+- **AI agent layer (in progress)**: `agent_server.py` is the current Anthropic-only slice. The
+  target is a local-first, provider-portable agent — Ollama as a free local placeholder, Claude
+  at scale, a fallback/compare mode, and a medical-tuned model consulted as a tool — with a real
+  tool-calling loop. Full design: [`docs/agent-design.md`](./docs/agent-design.md).
+
+See [`CLAUDE.md`](./CLAUDE.md) for deeper architecture notes and gotchas, and
+[`docs/agent-design.md`](./docs/agent-design.md) for the agent-layer design.

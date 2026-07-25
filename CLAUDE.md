@@ -31,6 +31,17 @@ simulator.py ──JSON──▶ Kafka topic `wearables.raw` ──▶ spark_pro
   `avg_hr > 140 AND workout_samples == 0` to the agent endpoint.
 - **`agent_stub.py`** — a stand-in AI agent on `:8000` that just logs POST bodies; swap for
   the real agent later.
+- **`agent_server.py`** — the real clinical-triage **AI agent** (FastAPI on `:8000`). On each
+  anomaly POST it runs a Claude (`claude-opus-4-8`) tool-use loop with two tools —
+  `fetch_historical_trends(user_id)` (reads the Delta table for the user's 7-day HR baseline)
+  and `convert_to_fhir(user_id, metrics)` (builds a FHIR R4 `Observation`, LOINC 8867-4) —
+  then reasons about whether the reading is a dangerous outlier vs. that baseline and returns a
+  **Clinician Action Report** (`RISK LEVEL: LOW|ELEVATED|CRITICAL`). A third alternative for the
+  `:8000` anomaly sink (run exactly one of `agent_stub` / `dashboard` / `agent_server`).
+  **The target architecture is a local-first, provider-portable agent** (Ollama placeholder →
+  Claude at scale, with a fallback/compare mode and a medical model consulted as a tool) —
+  see [`docs/agent-design.md`](docs/agent-design.md). `agent_server.py` is the current
+  Anthropic-only slice that will fold into the `AnthropicBackend` case of that design.
 - **`dashboard.py`** — a Flask live dashboard on `:8000` (a superset of `agent_stub.py` — run
   **one or the other**, not both). It consumes the raw topic directly for a live per-user HR
   chart, receives Spark's anomaly POSTs at `/anomaly`, and reads the Delta table back
@@ -52,7 +63,10 @@ field name requires updating `RAW_SCHEMA` (and the `normalize()` projection) or 
 Prerequisites: Homebrew Kafka, a JDK 8/11/17 (**not** newer — Spark 3.5 rejects Java 16+),
 and Python deps: `pip install pyspark==3.5.1 delta-spark==3.2.0 requests kafka-python numpy pandas`.
 For the dashboard also: `pip install flask deltalake` (the windows panel degrades gracefully
-without `deltalake`).
+without `deltalake`). For the AI agent (`agent_server.py`): `pip install fastapi "uvicorn[standard]"
+anthropic deltalake` **plus** Anthropic credentials — `export ANTHROPIC_API_KEY=...` or
+`ant auth login` (the zero-arg client resolves either). Without credentials the `/anomaly`
+endpoint returns a graceful JSON error instead of a report.
 
 ### One-command demo
 
@@ -76,6 +90,19 @@ python3 dashboard.py        # live chart + anomaly feed + windows table at :8000
 python3 simulator.py
 python3 spark_processor.py
 ```
+
+### AI triage agent (manual)
+
+```bash
+export ANTHROPIC_API_KEY=...        # or `ant auth login`
+python3 agent_server.py             # clinical agent on :8000 (drop-in for agent_stub)
+python3 simulator.py
+python3 spark_processor.py          # POSTs anomalies to :8000/anomaly by default
+```
+
+Each anomaly returns JSON with `report`, `risk_level`, `baseline` (tool output), `fhir`
+(the Observation), and `model`. Note it needs Delta history to have a baseline — run the
+processor a while first, or it reasons from the reading alone.
 
 ### Local quickstart (verified path — no Docker)
 
@@ -151,6 +178,12 @@ kafka-console-consumer --bootstrap-server localhost:9092 --topic wearables.raw \
   `host.docker.internal:8000`. The Homebrew path above is the working alternative.
 - **`kafka-python` 3.x removed `NoBrokersAvailable`** — `simulator.py` imports it with a
   try/except fallback to the base `KafkaError`. Keep that guard if editing the imports.
+- **`agent_server.py` sends `output_config` via `extra_body`** — older `anthropic` SDKs (e.g.
+  0.72.0) don't type the `output_config`/`effort` kwarg and would raise `TypeError`; passing it
+  through `extra_body` forwards it as JSON so the call constructs on old SDKs and still sends the
+  right fields to the current API. Adaptive `thinking` is passed as a plain dict for the same
+  reason. FastAPI route/model annotations use `Optional[...]`/`Dict[...]` (not `X | None` / `dict[...]`)
+  because the anaconda runtime is Python 3.8, which can't evaluate those at import time.
 - **macOS lacks GNU `timeout`** — use `kafka-console-consumer --timeout-ms` instead of piping
   through `timeout`.
 - **Watermark stalls on bursty input** — append-mode windows finalize only when *event-time*
