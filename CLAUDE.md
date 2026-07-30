@@ -31,17 +31,23 @@ simulator.py ──JSON──▶ Kafka topic `wearables.raw` ──▶ spark_pro
   `avg_hr > 140 AND workout_samples == 0` to the agent endpoint.
 - **`agent_stub.py`** — a stand-in AI agent on `:8000` that just logs POST bodies; swap for
   the real agent later.
-- **`agent_server.py`** — the real clinical-triage **AI agent** (FastAPI on `:8000`). On each
-  anomaly POST it runs a Claude (`claude-opus-4-8`) tool-use loop with two tools —
-  `fetch_historical_trends(user_id)` (reads the Delta table for the user's 7-day HR baseline)
-  and `convert_to_fhir(user_id, metrics)` (builds a FHIR R4 `Observation`, LOINC 8867-4) —
-  then reasons about whether the reading is a dangerous outlier vs. that baseline and returns a
-  **Clinician Action Report** (`RISK LEVEL: LOW|ELEVATED|CRITICAL`). A third alternative for the
-  `:8000` anomaly sink (run exactly one of `agent_stub` / `dashboard` / `agent_server`).
-  **The target architecture is a local-first, provider-portable agent** (Ollama placeholder →
-  Claude at scale, with a fallback/compare mode and a medical model consulted as a tool) —
-  see [`docs/agent-design.md`](docs/agent-design.md). `agent_server.py` is the current
-  Anthropic-only slice that will fold into the `AnthropicBackend` case of that design.
+- **`agent_server.py`** — the clinical-triage **AI agent** (FastAPI on `:8000`). On each anomaly
+  POST it runs a *real tool-calling loop* over a **pluggable LLM backend** (`OllamaBackend`
+  default / `AnthropicBackend`, selected by `AGENT_BACKEND`; comma-list = fallback chain) and
+  returns a **Clinician Action Report** (`RISK LEVEL: LOW|ELEVATED|CRITICAL`) plus a `tool_trace`.
+  Six agent tools: `fetch_historical_trends` (7-day Delta baseline), `recall_patient_memory`
+  (prior assessments — cross-session memory), `lookup_vitals_reference` (static ranges),
+  `analyze_hr_trend` (EWMA + z-score outlier from Delta), `consult_medical_model` (a medical-tuned
+  Ollama model as a tool), and `notify_clinician` (a logged action). `convert_to_fhir` runs
+  **deterministically after** the loop (LOINC 8867-4), never as a model gamble. A deterministic
+  **safety floor** can raise but never lower the model's risk level. Assessments persist to
+  `./agent_memory` (read back by `recall_patient_memory`) and Observations to `./fhir_store` —
+  both **outside `./lakehouse`** so pipeline teardown doesn't erase learned history; `GET /memory`
+  inspects them. Dispatch is hardened for small-model fumbling (drops hallucinated kwargs, injects
+  `user_id`/`current_hr`, success-based loop guard). A third alternative for the `:8000` anomaly
+  sink (run exactly one of `agent_stub` / `dashboard` / `agent_server`). Design + roadmap:
+  [`docs/agent-design.md`](docs/agent-design.md) — Phases 1 & 4 done locally; the Claude backend
+  (Phases 2–3) is deferred but already stubbed as `AnthropicBackend`.
 - **`dashboard.py`** — a Flask live dashboard on `:8000` (a superset of `agent_stub.py` — run
   **one or the other**, not both). It consumes the raw topic directly for a live per-user HR
   chart, receives Spark's anomaly POSTs at `/anomaly`, and reads the Delta table back
@@ -64,8 +70,11 @@ Prerequisites: Homebrew Kafka, a JDK 8/11/17 (**not** newer — Spark 3.5 reject
 and Python deps: `pip install pyspark==3.5.1 delta-spark==3.2.0 requests kafka-python numpy pandas`.
 For the dashboard also: `pip install flask deltalake` (the windows panel degrades gracefully
 without `deltalake`). For the AI agent (`agent_server.py`): `pip install fastapi "uvicorn[standard]"
-anthropic deltalake` **plus** Anthropic credentials — `export ANTHROPIC_API_KEY=...` or
-`ant auth login` (the zero-arg client resolves either). Without credentials the `/anomaly`
+ollama anthropic deltalake pandas`. The **default backend is local Ollama** (no API key): run
+`ollama serve` and pull the models — `ollama pull llama3.1:8b` (orchestrator) and
+`ollama pull meditron` (medical specialist, consulted as a tool). To use Claude instead, set
+`AGENT_BACKEND=anthropic` **plus** credentials — `export ANTHROPIC_API_KEY=...` or `ant auth login`
+(the zero-arg client resolves either). If the selected backend is unreachable the `/anomaly`
 endpoint returns a graceful JSON error instead of a report.
 
 ### One-command demo
@@ -94,15 +103,18 @@ python3 spark_processor.py
 ### AI triage agent (manual)
 
 ```bash
-export ANTHROPIC_API_KEY=...        # or `ant auth login`
+ollama serve &                      # default backend is local Ollama (no API key)
 python3 agent_server.py             # clinical agent on :8000 (drop-in for agent_stub)
 python3 simulator.py
 python3 spark_processor.py          # POSTs anomalies to :8000/anomaly by default
+# curl "http://localhost:8000/memory?user_id=<uid>"   # inspect cross-session memory
 ```
 
-Each anomaly returns JSON with `report`, `risk_level`, `baseline` (tool output), `fhir`
-(the Observation), and `model`. Note it needs Delta history to have a baseline — run the
-processor a while first, or it reasons from the reading alone.
+Each anomaly returns JSON with `report`, `risk_level`, `baseline`, `memory` (prior
+assessments), `trend` (EWMA), `fhir` (the Observation), `tool_trace`, `clinician_notified`, and
+`model`. Note it needs Delta history for a baseline/trend — run the processor a while first, or
+it reasons from the reading alone. Latency is ~1–2 min/anomaly on the local 8B backend; set
+`AGENT_BACKEND=anthropic` (with credentials) for the faster/cleaner Claude path.
 
 ### Local quickstart (verified path — no Docker)
 

@@ -15,10 +15,15 @@ Select with AGENT_BACKEND=ollama|anthropic (comma-list = fallback chain, tried i
 
 Tools the agent can call:
   fetch_historical_trends(user_id, days)      — 7-day HR baseline from Delta Lake
+  recall_patient_memory(user_id)              — prior assessments (cross-session memory)
   lookup_vitals_reference(metric)             — clinical normal ranges (deterministic)
+  analyze_hr_trend(user_id, current_hr)       — EWMA trend + z-score outlier from Delta
   consult_medical_model(question, context)    — ask a medical-tuned Ollama model
+  notify_clinician(user_id, risk_level, msg)  — real action: log an outbound alert
   submit_report(risk_level, ...)              — structured finish; ends the loop
 convert_to_fhir is applied deterministically after the loop (never a valid-FHIR gamble).
+Each assessment is persisted to ./agent_memory (recall_patient_memory reads it back) and the
+FHIR Observation is written to ./fhir_store — both OUTSIDE ./lakehouse so they survive teardown.
 
 Run:
     pip install fastapi "uvicorn[standard]" ollama anthropic deltalake pandas
@@ -31,6 +36,7 @@ Decision support for demonstration — not a medical device, not a diagnosis.
 from __future__ import annotations
 
 import datetime as dt
+import inspect
 import json
 import os
 from abc import ABC, abstractmethod
@@ -56,9 +62,60 @@ ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-8")
 DELTA_PATH = os.getenv("DELTA_PATH", "./lakehouse/wearable_windows")
 PORT = int(os.getenv("AGENT_PORT", "8000"))
 BASELINE_DAYS = int(os.getenv("BASELINE_DAYS", "7"))
-MAX_TURNS = int(os.getenv("AGENT_MAX_TURNS", "12"))
+MAX_TURNS = int(os.getenv("AGENT_MAX_TURNS", "16"))
+
+# Cross-session memory + FHIR store live OUTSIDE ./lakehouse so tearing the pipeline
+# down (which wipes lakehouse) does not erase the agent's learned history.
+MEMORY_DIR = os.getenv("AGENT_MEMORY_DIR", "./agent_memory")
+FHIR_STORE_DIR = os.getenv("FHIR_STORE_DIR", "./fhir_store")
+MEMORY_RECALL_LIMIT = int(os.getenv("MEMORY_RECALL_LIMIT", "10"))
 
 _SEVERITY = {"LOW": 0, "ELEVATED": 1, "CRITICAL": 2}
+
+
+# --------------------------------------------------------------------------- #
+# Persistence helpers (cross-session memory + FHIR store, both JSONL/file-based)
+# --------------------------------------------------------------------------- #
+
+def _assessments_path() -> str:
+    return os.path.join(MEMORY_DIR, "assessments.jsonl")
+
+
+def _notifications_path() -> str:
+    return os.path.join(MEMORY_DIR, "notifications.jsonl")
+
+
+def _append_jsonl(path: str, record: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def _read_jsonl(path: str) -> List[Dict[str, Any]]:
+    if not os.path.exists(path):
+        return []
+    out: List[Dict[str, Any]] = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                continue
+    return out
+
+
+def _persist_fhir(user_id: str, fhir: Dict[str, Any]) -> str:
+    ts = fhir.get("effectiveDateTime") or dt.datetime.now(dt.timezone.utc).isoformat()
+    safe = "".join(c if c.isalnum() else "_" for c in ts)
+    d = os.path.join(FHIR_STORE_DIR, user_id)
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f"{safe}.json")
+    with open(path, "w") as f:
+        json.dump(fhir, f, indent=2)
+    return path
 
 
 # --------------------------------------------------------------------------- #
@@ -151,6 +208,90 @@ def consult_medical_model(question: str, context: str = "") -> Dict[str, Any]:
         return {"error": f"medical model unavailable: {exc}"}
 
 
+def recall_patient_memory(user_id: str, limit: int = MEMORY_RECALL_LIMIT) -> Dict[str, Any]:
+    """Recall this user's prior anomaly assessments from persistent cross-session memory."""
+    records = [r for r in _read_jsonl(_assessments_path()) if r.get("user_id") == user_id]
+    if not records:
+        return {"available": False, "user_id": user_id, "prior_count": 0,
+                "reason": f"no prior assessments recorded for {user_id} (first-time event)"}
+    records = records[-limit:]
+    levels = [r.get("risk_level") for r in records]
+    return {
+        "available": True,
+        "user_id": user_id,
+        "prior_count": len(records),
+        "last_assessment_at": records[-1].get("ts"),
+        "risk_levels_seen": levels,
+        "critical_count": sum(1 for lvl in levels if lvl == "CRITICAL"),
+        "recent": [
+            {"ts": r.get("ts"), "avg_hr": r.get("avg_hr"), "risk_level": r.get("risk_level"),
+             "summary": r.get("summary"), "recommended_action": r.get("recommended_action")}
+            for r in records[-5:]
+        ],
+    }
+
+
+def analyze_hr_trend(user_id: str, days: int = BASELINE_DAYS,
+                     current_hr: Optional[float] = None) -> Dict[str, Any]:
+    """EWMA trend of the user's recent resting HR + how the current reading compares."""
+    if DeltaTable is None:
+        return {"available": False, "reason": "deltalake not installed"}
+    try:
+        import numpy as np  # noqa: F401
+        import pandas as pd
+        df = DeltaTable(DELTA_PATH).to_pandas()
+    except Exception as exc:
+        return {"available": False, "reason": f"could not read Delta table: {exc}"}
+
+    df = df[df["user_id"] == user_id].copy()
+    if df.empty:
+        return {"available": False, "reason": f"no history for {user_id}"}
+
+    # Prefer resting windows for a stable trend; fall back to all if too few.
+    resting = df[df["workout_samples"] == 0].copy()
+    use = resting if len(resting) >= 3 else df.copy()
+    use["ws"] = pd.to_datetime(use["window_start"], errors="coerce", utc=True)
+    use = use.sort_values("ws")
+    series = use["avg_hr"].astype(float).reset_index(drop=True)
+
+    span = min(10, max(2, len(series)))
+    ewma = series.ewm(span=span).mean()
+    recent = series.tail(20)
+    mean = float(recent.mean())
+    std = float(recent.std(ddof=0)) or 1.0
+    direction = ("rising" if ewma.iloc[-1] > ewma.iloc[0] + 1
+                 else "falling" if ewma.iloc[-1] < ewma.iloc[0] - 1 else "stable")
+
+    out: Dict[str, Any] = {
+        "available": True, "user_id": user_id, "window_count": int(len(use)),
+        "ewma_resting_hr": round(float(ewma.iloc[-1]), 1),
+        "recent_mean_hr": round(mean, 1), "recent_std_hr": round(std, 1),
+        "trend": direction,
+    }
+    if current_hr is not None:
+        try:
+            z = (float(current_hr) - mean) / std
+            out["current_hr"] = float(current_hr)
+            out["z_score"] = round(z, 1)
+            out["is_statistical_outlier"] = bool(abs(z) >= 3)
+        except Exception:
+            pass
+    return out
+
+
+def notify_clinician(user_id: str, risk_level: str, message: str) -> Dict[str, Any]:
+    """Record an outbound clinician alert — a real action, logged to persistent memory."""
+    record = {
+        "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "user_id": user_id, "risk_level": str(risk_level).upper(),
+        "message": message, "channel": "local-log",
+    }
+    _append_jsonl(_notifications_path(), record)
+    return {"delivered": True, "channel": "local-log", "user_id": user_id,
+            "risk_level": record["risk_level"],
+            "note": "notification recorded to agent_memory/notifications.jsonl"}
+
+
 def convert_to_fhir(user_id: str, metrics: Dict[str, Any]) -> Dict[str, Any]:
     """Structure a heart-rate reading into a FHIR R4 Observation (deterministic)."""
     hr = metrics.get("heart_rate_bpm", metrics.get("avg_hr"))
@@ -227,11 +368,41 @@ TOOL_SPECS = [
         }, "required": ["user_id"]},
     },
     {
+        "name": "recall_patient_memory",
+        "description": "Recall this user's PRIOR anomaly assessments from the agent's persistent "
+                       "memory (past risk levels, actions taken, timestamps). Call this early to "
+                       "learn whether this anomaly is recurrent or a first-time event.",
+        "parameters": {"type": "object", "properties": {
+            "user_id": {"type": "string"}}, "required": ["user_id"]},
+    },
+    {
         "name": "lookup_vitals_reference",
         "description": "Get clinical normal ranges for a vital sign "
                        "(heart_rate, resp_rate, hrv, spo2). Use to ground your thresholds.",
         "parameters": {"type": "object", "properties": {
             "metric": {"type": "string"}}, "required": ["metric"]},
+    },
+    {
+        "name": "analyze_hr_trend",
+        "description": "Compute an EWMA trend of the user's recent resting heart rate and how the "
+                       "current reading compares (z-score, statistical-outlier flag). Use this for "
+                       "a smarter signal than a single fixed threshold. Pass current_hr = the "
+                       "alert's avg_hr to get the z-score.",
+        "parameters": {"type": "object", "properties": {
+            "user_id": {"type": "string"},
+            "days": {"type": "integer", "description": f"Look-back days (default {BASELINE_DAYS})."},
+            "current_hr": {"type": "number", "description": "The current window's avg HR to compare."},
+        }, "required": ["user_id"]},
+    },
+    {
+        "name": "notify_clinician",
+        "description": "Send an alert to the on-call clinician. This is a REAL ACTION — call it "
+                       "only for ELEVATED or CRITICAL findings that warrant human attention, "
+                       "before submit_report. Provide a concise, specific message.",
+        "parameters": {"type": "object", "properties": {
+            "user_id": {"type": "string"},
+            "risk_level": {"type": "string", "enum": ["ELEVATED", "CRITICAL"]},
+            "message": {"type": "string"}}, "required": ["user_id", "risk_level", "message"]},
     },
     {
         "name": "consult_medical_model",
@@ -258,8 +429,11 @@ TOOL_SPECS = [
 
 TOOL_FUNCS: Dict[str, Callable[..., Dict[str, Any]]] = {
     "fetch_historical_trends": fetch_historical_trends,
+    "recall_patient_memory": recall_patient_memory,
     "lookup_vitals_reference": lookup_vitals_reference,
+    "analyze_hr_trend": analyze_hr_trend,
     "consult_medical_model": consult_medical_model,
+    "notify_clinician": notify_clinician,
     "submit_report": submit_report,
 }
 
@@ -274,13 +448,18 @@ SYSTEM = (
     "- Call submit_report EXACTLY ONCE, as your final action.\n\n"
     "Suggested flow:\n"
     "1. fetch_historical_trends — establish the user's own recent baseline.\n"
-    "2. lookup_vitals_reference('heart_rate') — ground your thresholds in clinical norms.\n"
-    "3. (optional) consult_medical_model — if you are unsure whether the reading is dangerous.\n"
-    "4. submit_report — risk_level (LOW/ELEVATED/CRITICAL), a one-line summary, your reasoning "
-    "(compare the reading to the baseline), and a recommended action.\n\n"
-    "Judge DANGER relative to the user's baseline and vital-sign norms, not just the raw number. "
-    "A sustained resting heart rate far above the user's baseline is dangerous. You are decision "
-    "support, not a diagnosis; rely on tool output and default to caution."
+    "2. recall_patient_memory — check whether this user has had prior anomalies (recurrent vs new).\n"
+    "3. lookup_vitals_reference('heart_rate') — ground your thresholds in clinical norms.\n"
+    "4. analyze_hr_trend(current_hr=<alert avg_hr>) — get an EWMA trend + z-score outlier signal.\n"
+    "5. (optional) consult_medical_model — if you are still unsure whether the reading is dangerous.\n"
+    "6. notify_clinician — if your finding is ELEVATED or CRITICAL, alert the on-call clinician "
+    "BEFORE submitting (this is a real action; skip it for LOW).\n"
+    "7. submit_report — risk_level (LOW/ELEVATED/CRITICAL), a one-line summary, your reasoning "
+    "(compare the reading to the baseline, trend, and any prior history), and a recommended action.\n\n"
+    "Judge DANGER relative to the user's baseline, trend, and vital-sign norms, not just the raw "
+    "number. A sustained resting heart rate far above the user's baseline is dangerous; a recurrent "
+    "critical pattern raises concern further. You are decision support, not a diagnosis; rely on "
+    "tool output and default to caution."
 )
 
 
@@ -419,20 +598,48 @@ def _safety_floor(anomaly: Dict[str, Any]) -> str:
 
 def run_agent(anomaly: Dict[str, Any]) -> Dict[str, Any]:
     """Drive the tool loop over the backend chain, then guarantee correctness."""
-    captured: Dict[str, Any] = {"baseline": None}
+    captured: Dict[str, Any] = {"baseline": None, "memory": None, "trend": None}
+    success_counts: Dict[str, int] = {}
+    REPEAT_LIMIT = 2  # small models loop on read-only tools; steer them to finish
+
+    def _coerce_args(func: Callable[..., Any], name: str, raw: Dict[str, Any]) -> Dict[str, Any]:
+        """Make small-model tool calls robust: drop hallucinated kwargs the function does not
+        accept, and inject known context (user_id, current_hr) the server already has when the
+        model omits it. This turns most 'bad arguments' failures into successful calls."""
+        params = set(inspect.signature(func).parameters)
+        clean = {k: v for k, v in raw.items() if k in params}
+        if "user_id" in params and not clean.get("user_id"):
+            clean["user_id"] = anomaly.get("user_id")
+        if name == "analyze_hr_trend" and "current_hr" in params and "current_hr" not in clean:
+            clean["current_hr"] = anomaly.get("avg_hr")
+        return clean
 
     def dispatch(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         func = TOOL_FUNCS.get(name)
         if func is None:
             return {"error": f"unknown tool {name}"}
+        # Loop guard: a confused small model re-calls the same tool forever. Once it has
+        # SUCCEEDED enough times, stop recomputing and nudge it to finish. Only *successful*
+        # calls count — a malformed call that errored must be retryable, not blocked.
+        if name != "submit_report" and success_counts.get(name, 0) >= REPEAT_LIMIT:
+            return {"note": f"You have already called {name} successfully and have its result. "
+                            "Do NOT call it again. You have enough information: if the finding is "
+                            "ELEVATED or CRITICAL call notify_clinician (once), then call "
+                            "submit_report NOW with your verdict."}
         try:
-            result = func(**args)
+            result = func(**_coerce_args(func, name, args))
         except TypeError as exc:
+            # Still malformed after coercion (missing a genuine required arg): let it retry.
             return {"error": f"bad arguments for {name}: {exc}"}
         except Exception as exc:
             return {"error": str(exc)}
+        success_counts[name] = success_counts.get(name, 0) + 1
         if name == "fetch_historical_trends":
             captured["baseline"] = result
+        elif name == "recall_patient_memory":
+            captured["memory"] = result
+        elif name == "analyze_hr_trend":
+            captured["trend"] = result
         return result
 
     user_prompt = ("A wearable anomaly alert fired. Assess it and submit a Clinician Action "
@@ -481,6 +688,25 @@ def run_agent(anomaly: Dict[str, Any]) -> Dict[str, Any]:
 
     report_text = _format_report(final_level, summary, reasoning, action,
                                  floor_applied, floor, run)
+
+    # Persist to cross-session memory + FHIR store (deterministic, code-guaranteed).
+    user_id = anomaly.get("user_id", "unknown")
+    assessment = {
+        "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "user_id": user_id,
+        "avg_hr": anomaly.get("avg_hr"),
+        "max_hr": anomaly.get("max_hr"),
+        "risk_level": final_level,
+        "summary": summary,
+        "recommended_action": action,
+        "tools_used": [t["tool"] for t in run.trace],
+        "backend": used_backend,
+        "model": run.model,
+        "safety_floor_applied": floor_applied,
+    }
+    _append_jsonl(_assessments_path(), assessment)
+    fhir_path = _persist_fhir(user_id, fhir)
+
     return {
         "status": "ok",
         "backend": used_backend,
@@ -489,9 +715,13 @@ def run_agent(anomaly: Dict[str, Any]) -> Dict[str, Any]:
         "is_dangerous": final_level != "LOW",
         "report": report_text,
         "baseline": captured["baseline"],
+        "memory": captured["memory"],
+        "trend": captured["trend"],
         "fhir": fhir,
         "tool_trace": run.trace,
         "safety_floor_applied": floor_applied,
+        "clinician_notified": any(t["tool"] == "notify_clinician" for t in run.trace),
+        "persisted": {"assessment_log": _assessments_path(), "fhir": fhir_path},
     }
 
 
@@ -545,7 +775,22 @@ class AnomalyAlert(BaseModel, extra="allow"):
 @app.get("/health")
 def health() -> Dict[str, Any]:
     return {"status": "ok", "backends": BACKENDS, "ollama_model": OLLAMA_MODEL,
-            "medical_model": OLLAMA_MEDICAL_MODEL, "delta_path": DELTA_PATH}
+            "medical_model": OLLAMA_MEDICAL_MODEL, "delta_path": DELTA_PATH,
+            "memory_dir": MEMORY_DIR, "fhir_store": FHIR_STORE_DIR,
+            "tools": [s["name"] for s in TOOL_SPECS]}
+
+
+@app.get("/memory")
+def memory(user_id: Optional[str] = None) -> Dict[str, Any]:
+    """Inspect the agent's persistent memory (assessments + clinician notifications)."""
+    assessments = _read_jsonl(_assessments_path())
+    notifications = _read_jsonl(_notifications_path())
+    if user_id:
+        assessments = [a for a in assessments if a.get("user_id") == user_id]
+        notifications = [n for n in notifications if n.get("user_id") == user_id]
+    return {"user_id": user_id, "assessment_count": len(assessments),
+            "notification_count": len(notifications),
+            "assessments": assessments[-20:], "notifications": notifications[-20:]}
 
 
 @app.post("/anomaly")

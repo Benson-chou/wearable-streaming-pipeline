@@ -3,8 +3,10 @@
 Design for the agentic AI layer that consumes wearable anomaly alerts, reasons about
 them with tool use, and emits a FHIR `Observation` + Clinician Action Report.
 
-**Status:** approved design; Phase 1 not yet implemented. Supersedes the single-backend
-`agent_server.py` (Anthropic-only) as the target architecture.
+**Status:** Phase 1 (local Ollama tool-loop) **done**; Phase 4 (cross-session memory + richer
+tools) **done locally**. Phases 2–3 (the Claude backend + compare/fallback) are intentionally
+**deferred** — the local agentic surface is being built out first. This design supersedes the
+single-backend `agent_server.py` (Anthropic-only) as the target architecture.
 
 ## Goals
 
@@ -91,13 +93,21 @@ consult the specialist:
 | Tool | Kind | What it does | Why it teaches agency |
 |---|---|---|---|
 | `fetch_historical_trends(user_id, days)` | data (Delta) | 7-day baseline (overall + resting) | Learn *this* user's normal before judging |
+| `recall_patient_memory(user_id)` | memory (read) | Prior assessments for this user (risk levels, actions, timestamps) | Is this recurrent or first-time? State across sessions |
 | `lookup_vitals_reference(metric)` | retrieval (static) | Clinical normal ranges (deterministic dict) | Ground thresholds in facts, not hallucination |
+| `analyze_hr_trend(user_id, current_hr)` | data (Delta) | EWMA of recent resting HR + z-score / outlier flag for the current reading | A smarter-than-fixed-threshold signal the agent opts into |
 | `consult_medical_model(question, context)` | sub-model | Ask the **medical-tuned** Ollama model for a specialist opinion | Agent decides *when* it needs an expert (router→specialist) |
+| `notify_clinician(user_id, risk_level, message)` | action (write) | Log an outbound clinician alert (real side effect) | The agent *acts*, not just reports — only for ELEVATED/CRITICAL |
 | `submit_report(risk_level, summary, reasoning, recommended_action)` | structured finish | Final action; ends the loop with structured output | "The last tool call is your typed output" — reliable on any model |
 
 `convert_to_fhir` stays **out** of the agent's hands — it runs deterministically after
 `submit_report`, so the FHIR resource is always valid. (Optional: let the agent supply the
 `note` narrative text.)
+
+**Persistence (deterministic, after the loop):** every assessment is appended to
+`./agent_memory/assessments.jsonl` (which `recall_patient_memory` reads back — that's the
+cross-session memory), and each FHIR `Observation` is written to `./fhir_store/{user_id}/`.
+Both live **outside** `./lakehouse` so tearing the pipeline down does not erase learned history.
 
 ## Medical model as a specialist tool
 
@@ -139,19 +149,31 @@ Same request as `agent_server.py` today; response gains `backend`, `model`, `too
 ```json
 { "status":"ok", "backend":"ollama", "model":"llama3.1:8b",
   "risk_level":"CRITICAL", "is_dangerous":true,
-  "report":"…", "baseline":{…}, "fhir":{…},
+  "report":"…", "baseline":{…}, "memory":{…}, "trend":{…}, "fhir":{…},
   "tool_trace":[
      {"tool":"fetch_historical_trends","args":{…},"result":{…}},
-     {"tool":"consult_medical_model","args":{…},"result":"…"},
+     {"tool":"recall_patient_memory","args":{…},"result":{…}},
+     {"tool":"analyze_hr_trend","args":{…},"result":{…}},
+     {"tool":"notify_clinician","args":{…},"result":{…}},
      {"tool":"submit_report","args":{…}} ],
-  "safety_floor_applied": true }
+  "safety_floor_applied": true, "clinician_notified": true,
+  "persisted": {"assessment_log":"./agent_memory/assessments.jsonl", "fhir":"./fhir_store/…"} }
 ```
+
+Inspect accumulated state at any time: `GET /memory?user_id=…` returns the stored assessments
+and clinician notifications.
 
 ## Failure handling (also a lesson)
 
-- **Tool errors** → returned to the model as `is_error` results so it can recover mid-loop.
-- **Malformed tool args** from a small model → caught, returned as an error result, one retry,
-  then a deterministic fallback report.
+- **Tool errors** → returned to the model as error results so it can recover mid-loop.
+- **Malformed tool args** from a small model → the dispatcher **coerces** before failing: it
+  drops hallucinated kwargs the function doesn't accept (e.g. `ewma_weight`, `z_score_threshold`)
+  and injects known context (`user_id`, `current_hr`) from the anomaly the server already holds.
+  This alone turned a 14×-repeated failing `analyze_hr_trend` loop into a single clean call.
+  Genuinely-missing required args still return an error result so the model can retry.
+- **Repeat-call loop guard** → only *successful* calls count toward a per-tool repeat limit, so
+  once the agent has an answer it's steered to `notify_clinician`/`submit_report` — but a call it
+  fumbled and then self-corrects is never wrongly blocked.
 - **Ollama unreachable** → clear error, or next backend in the chain — never a silent jump to
   the paid API.
 - **Max-turns guard** so a confused local model can't loop forever.
@@ -173,10 +195,22 @@ Same request as `agent_server.py` today; response gains `backend`, `model`, `too
     but a better medical fine-tune (or the Claude path) improves quality.
   - Latency ~2 min/anomaly warm on an M4 Pro (8B multi-turn + a second model load for the consult).
     Motivates the Phase-2 Claude backend for cleaner, faster completion.
-- **Phase 2:** `AnthropicBackend` behind the same interface + `?compare=1`.
-- **Phase 3:** fallback chain; prompt caching + structured outputs on the Claude path.
-- **Phase 4:** richer tools (`notify_clinician`, write to a FHIR store, EWMA trend detection),
-  cross-session memory, multi-turn follow-ups.
+- **Phase 4 (DONE, local):** richer tools + cross-session memory, built out before the Claude
+  backend (Phases 2–3 deferred by choice). Added `recall_patient_memory` (memory read),
+  `analyze_hr_trend` (EWMA + z-score), and `notify_clinician` (action). Each assessment persists
+  to `./agent_memory` and each Observation to `./fhir_store`, both outside `./lakehouse`.
+  Verified end-to-end with `llama3.1:8b`:
+  - Two anomalies for the same user, run in sequence — the **second recalled the first** from
+    memory (`prior_count: 1, ['CRITICAL']`) and cited it in the report ("prior history of
+    critical readings, which raises further concern").
+  - With 7 tools the model fumbles more (hallucinated arg names, omitted `user_id`, looped on one
+    tool). The **arg-coercion + success-based loop guard** (see Failure handling) were needed to
+    get clean convergence — runs dropped from ~290s (14 failed loops) to ~120–150s reaching
+    `submit_report`. You can still see the fumble-then-retry in the `tool_trace`; it's now bounded.
+  - Still-open: `notify_clinician` is a local log, not a real channel; the medical consult and a
+    `write-to-FHIR-store` *as a tool* (vs. deterministic) remain future work.
+- **Phase 2 (deferred):** `AnthropicBackend` behind the same interface + `?compare=1`.
+- **Phase 3 (deferred):** fallback chain; prompt caching + structured outputs on the Claude path.
 - **Phase 5:** the same tool defs lift into Anthropic **Managed Agents** (hosted loop) with
   near-zero rewrite — the portable-tool design is what makes that cheap.
 

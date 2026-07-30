@@ -2,6 +2,10 @@
 lakehouse/
 dashboard_snapshot.html
 
+# Agent runtime state (cross-session memory + FHIR store)
+agent_memory/
+fhir_store/
+
 # Python
 __pycache__/
 *.pyc
